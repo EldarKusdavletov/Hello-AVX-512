@@ -1,8 +1,8 @@
 #include <iostream>
+#include <fstream>
 #include <immintrin.h>
 #include <chrono>
 #include <random>
-#include <vector>
 
 bool is_avx2_supported() {
     return __builtin_cpu_supports("avx2");
@@ -18,22 +18,13 @@ void fill_random(float *array, int size) {
     }
 }
 
-void multiply_avx2(const float *array1, const float *array2, float *result, int size) {
-    int i = 0;
-    
-    for (; i <= size - 8; i += 8) {
-        __m256 vec1 = _mm256_loadu_ps(&array1[i]);
-        __m256 vec2 = _mm256_loadu_ps(&array2[i]);
-        __m256 vec_result = _mm256_mul_ps(vec1, vec2);
-        _mm256_storeu_ps(&result[i], vec_result);
-    }
-    
-    for (; i < size; ++i) {
+void multiply_scalar(const float *array1, const float *array2, float *result, int size) {
+    for (int i = 0; i < size; ++i) {
         result[i] = array1[i] * array2[i];
     }
 }
 
-void multiply_optimized(const float *array1, const float *array2, float *result, int size) {
+void multiply_unrolled(const float *array1, const float *array2, float *result, int size) {
     int i = 0;
     
     for (; i <= size - 8; i += 8) {
@@ -52,58 +43,86 @@ void multiply_optimized(const float *array1, const float *array2, float *result,
     }
 }
 
-void multiply_scalar(const float *array1, const float *array2, float *result, int size) {
-    for (int i = 0; i < size; ++i) {
+void multiply_avx2(const float *array1, const float *array2, float *result, int size) {
+    int i = 0;
+    
+    for (; i <= size - 8; i += 8) {
+        __m256 vec1 = _mm256_load_ps(&array1[i]);  // Aligned load
+        __m256 vec2 = _mm256_load_ps(&array2[i]);  // Aligned load
+        __m256 vec_result = _mm256_mul_ps(vec1, vec2);
+        _mm256_store_ps(&result[i], vec_result);  // Aligned store
+    }
+    
+    for (; i < size; ++i) {
         result[i] = array1[i] * array2[i];
     }
 }
 
-int main_run() {
-    const int N = 1024 * 1024 * 256;
-    std::vector<float> array1(N), array2(N), result_avx2(N), result_optimized(N), result_scalar(N);
+inline double timer(const float *array1, const float *array2, float *result, int size, void (*func)(const float *, const float *, float *, int), int iterations) {
+    std::ofstream file("misc/timing.csv", std::ios::app);
+    double total_time = 0;
     
-    fill_random(array1.data(), N);
-    fill_random(array2.data(), N);
+    for (int i = 0; i < iterations; ++i) {
+        auto start = std::chrono::high_resolution_clock::now();
+        func(array1, array2, result, size);
+        auto end = std::chrono::high_resolution_clock::now();
+        
+        std::chrono::duration<double> elapsed = end - start;
+        total_time += elapsed.count();
+        
+        if (file.is_open()) {
+            file << elapsed.count() << ',';
+        }
+    }
     
+    if (file.is_open()) {
+        file << '\n';
+    }
+    
+    return total_time / iterations;
+}
+
+int main(int argc, char *argv[]) {
     if (!is_avx2_supported()) {
         std::cerr << "AVX2 is not supported on this CPU!\n";
         return 1;
     }
     
-    auto start_avx2 = std::chrono::high_resolution_clock::now();
-    multiply_avx2(array1.data(), array2.data(), result_avx2.data(), N);
-    auto end_avx2 = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed_avx2 = end_avx2 - start_avx2;
+    std::ofstream file("misc/timing.csv", std::ios::trunc);
+    file.close();
     
-    auto start_optimized = std::chrono::high_resolution_clock::now();
-    multiply_optimized(array1.data(), array2.data(), result_optimized.data(), N);
-    auto end_optimized = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed_optimized = end_optimized - start_optimized;
+    const int N = 1024 * 1024 * 256;
+    int iterations = 1;
+    if (argc == 2) iterations = atoi(argv[1]);
     
-    auto start_scalar = std::chrono::high_resolution_clock::now();
-    multiply_scalar(array1.data(), array2.data(), result_scalar.data(), N);
-    auto end_scalar = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed_scalar = end_scalar - start_scalar;
+    float *array1 = (float *) _mm_malloc(N * sizeof(float), 32);
+    float *array2 = (float *) _mm_malloc(N * sizeof(float), 32);
+    float *result_avx2 = (float *) _mm_malloc(N * sizeof(float), 32);
+    float *result_unrolled = (float *) _mm_malloc(N * sizeof(float), 32);
+    float *result_scalar = (float *) _mm_malloc(N * sizeof(float), 32);
+    
+    fill_random(array1, N);
+    fill_random(array2, N);
+    
+    std::cout << "Time taken (Scalar): " << timer(array1, array2, result_scalar, N, multiply_scalar, iterations) << " seconds\n";
+    std::cout << "Time taken (Unrolled): " << timer(array1, array2, result_unrolled, N, multiply_unrolled, iterations) << " seconds\n";
+    std::cout << "Time taken (AVX2): " << timer(array1, array2, result_avx2, N, multiply_avx2, iterations) << " seconds\n";
     
     bool results_match = true;
     for (int i = 0; i < N; ++i) {
-        if (result_avx2[i] != result_scalar[i] || result_optimized[i] != result_scalar[i]) {
+        if (result_scalar[i] != result_unrolled[i] || result_scalar[i] != result_avx2[i]) {
             results_match = false;
             break;
         }
     }
     
     std::cout << "Results match: " << (results_match ? "Yes" : "No") << "\n";
-    std::cout << "Time taken (AVX2): " << elapsed_avx2.count() << " seconds\n";
-    std::cout << "Time taken (Optimized): " << elapsed_optimized.count() << " seconds\n";
-    std::cout << "Time taken (Scalar): " << elapsed_scalar.count() << " seconds\n";
     
-    return 0;
-}
-
-int main() {
-    for (int i = 0; i < 10; i++) {
-        if (main_run()) return 1;
-    }
+    _mm_free(array1);
+    _mm_free(array2);
+    _mm_free(result_avx2);
+    _mm_free(result_unrolled);
+    _mm_free(result_scalar);
+    
     return 0;
 }
